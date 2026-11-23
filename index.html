@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offline Highlight Scanner</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<style>
+  body {
+    margin: 0;
+    font: 16px/1.45 system-ui, sans-serif;
+    background: #f7f5f1;
+    color: #222;
+  }
+
+  .wrap {
+    max-width: 720px;
+    margin: auto;
+    padding: 18px;
+  }
+
+  h1 {
+    margin: 8px 0;
+  }
+
+  .card {
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+
+  input, select, button {
+    font: 15px system-ui, sans-serif;
+  }
+
+  input, select {
+    width: 100%;
+    padding: 9px;
+    margin: 6px 0;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-sizing: border-box;
+  }
+
+  .btn {
+    width: 100%;
+    padding: 12px;
+    border: 0;
+    border-radius: 8px;
+    background: #222;
+    color: #fff;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .ghost {
+    background: none;
+    border: 1px solid #ccc;
+    color: #555;
+    padding: 8px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+
+  .row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .row > * {
+    flex: 1;
+  }
+
+  .status {
+    font-size: 14px;
+    color: #666;
+    margin-top: 8px;
+    white-space: pre-wrap;
+  }
+
+  .highlight {
+    background: #fff;
+    border: 1px solid #ddd;
+    border-left-width: 6px;
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+  }
+
+  .highlight p {
+    margin: 0 0 6px;
+    white-space: pre-wrap;
+  }
+
+  .meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    color: #777;
+  }
+
+  .meta button {
+    background: none;
+    border: 0;
+    color: #777;
+    cursor: pointer;
+  }
+
+  .empty {
+    text-align: center;
+    color: #777;
+    padding: 30px 0;
+  }
+
+  .yellow { border-left-color: #f2cf2e; }
+  .green { border-left-color: #5ec27a; }
+  .blue { border-left-color: #5aa9ee; }
+  .red { border-left-color: #ec5b5b; }
+
+  .dot {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+
+  .yellow-dot { background: #f2cf2e; }
+  .green-dot { background: #5ec27a; }
+  .blue-dot { background: #5aa9ee; }
+  .red-dot { background: #ec5b5b; }
+</style>
+</head>
+
+<body>
+<div class="wrap">
+  <h1>Offline Highlight Scanner</h1>
+  <p>Reads highlighted text from PDF pages using your device. No Claude, no account, no AI subscription.</p>
+
+  <div class="card">
+    <strong>1. Choose PDF</strong>
+    <input id="pdfFile" type="file" accept="application/pdf">
+  </div>
+
+  <div class="card">
+    <strong>2. Optional page range</strong>
+    <div class="row">
+      <input id="fromPage" type="number" min="1" placeholder="From page">
+      <input id="toPage" type="number" min="1" placeholder="To page">
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>3. Scan highlights</strong>
+    <button class="btn" id="scanButton">Scan PDF</button>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="card">
+    <strong>Highlights</strong>
+    <div id="highlightList">
+      <div class="empty">No highlights yet.</div>
+    </div>
+
+    <button class="btn" id="downloadButton">Download highlights as PDF</button>
+    <div class="row" style="margin-top:8px">
+      <button class="ghost" id="copyButton">Copy as text</button>
+      <button class="ghost" id="clearButton">Clear all</button>
+    </div>
+  </div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const COLORS = ["yellow", "green", "blue", "red"];
+
+const COLOR_RANGES = {
+  yellow: { hue: [40, 70], saturation: 35, value: 45 },
+  green: { hue: [75, 165], saturation: 25, value: 35 },
+  blue: { hue: [180, 260], saturation: 25, value: 35 },
+  red: { hue: [335, 20], saturation: 35, value: 35 }
+};
+
+let highlights = JSON.parse(localStorage.getItem("offline-highlights") || "[]");
+let worker = null;
+
+const $ = id => document.getElementById(id);
+
+function save() {
+  localStorage.setItem("offline-highlights", JSON.stringify(highlights));
+}
+
+function setStatus(text) {
+  $("status").textContent = text;
+}
+
+function rgbToHsv(r, g, b) {
+  r /= 255;
+  g /= 255;
+  b /= 255;
+
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const difference = max - min;
+
+  let hue = 0;
+
+  if (difference) {
+    if (max === r) {
+      hue = ((g - b) / difference) % 6;
+    } else if (max === g) {
+      hue = (b - r) / difference + 2;
+    } else {
+      hue = (r - g) / difference + 4;
+    }
+
+    hue *= 60;
+
+    if (hue < 0) {
+      hue += 360;
+    }
+  }
+
+  const saturation = max ? difference / max : 0;
+  const value = max;
+
+  return {
+    hue,
+    saturation: saturation * 100,
+    value: value * 100
+  };
+}
+
+function isHighlightColor(pixel, color) {
+  const range = COLOR_RANGES[color];
+  const { hue, saturation, value } = rgbToHsv(
+    pixel[0],
+    pixel[1],
+    pixel[2]
+  );
+
+  const hueMatches =
+    range.hue[0] < range.hue[1]
+      ? hue >= range.hue[0] && hue <= range.hue[1]
+      : hue >= range.hue[0] || hue <= range.hue[1];
+
+  return (
+    hueMatches &&
+    saturation >= range.saturation &&
+    value >= range.value
+  );
+}
+
+function detectHighlightBands(canvas) {
+  const context = canvas.getContext("2d");
+  const imageData = context.getImageData(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  const data = imageData.data;
+  const width = canvas.width;
+  const height = canvas.height;
+
+  const rows = [];
+
+  for (let y = 0; y < height; y += 2) {
+    const counts = {
+      yellow: 0,
+      green: 0,
+      blue: 0,
+      red: 0
+    };
+
+    for (let x = 0; x < width; x += 2) {
+      const index = (y * width + x) * 4;
+      const pixel = [
+        data[index],
+        data[index + 1],
+        data[index + 2]
+      ];
+
+      for (const color of COLORS) {
+        if (isHighlightColor(pixel, color)) {
+          counts[color]++;
+        }
+      }
+    }
+
+    const bestColor = COLORS.reduce((best, color) =>
+      counts[color] > counts[best] ? color : best
+    );
+
+    if (counts[bestColor] > width * 0.015) {
+      rows.push({
+        y,
+        color: bestColor,
+        count: counts[bestColor]
+      });
+    }
+  }
+
+  const bands = [];
+
+  for (const row of rows) {
+    const last = bands[bands.length - 1];
+
+    if (
+      last &&
+      last.color === row.color &&
+      row.y - last.y2 <= 14
+    ) {
+      last.y2 = row.y;
+      last.rows.push(row);
+    } else {
+      bands.push({
+        color: row.color,
+        y1: row.y,
+        y2: row.y,
+        rows: [row]
+      });
+    }
+  }
+
+  return bands
+    .filter(band => band.rows.length >= 2)
+    .map(band => ({
+      color: band.color,
+      y1: Math.max(0, band.y1 - 8),
+      y2: Math.min(canvas.height, band.y2 + 8)
+    }));
+}
+
+async function getOcrWorker() {
+  if (!worker) {
+    worker = await Tesseract.createWorker("eng");
+  }
+
+  return worker;
+}
+
+async function readHighlightRegion(canvas, band) {
+  const padding = 12;
+
+  const crop = document.createElement("canvas");
+  crop.width = canvas.width;
+  crop.height = band.y2 - band.y1 + padding * 2;
+
+  const context = crop.getContext("2d");
+
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, crop.width, crop.height);
+
+  context.drawImage(
+    canvas,
+    0,
+    band.y1 - padding,
+    canvas.width,
+    band.y2 - band.y1 + padding * 2,
+    0,
+    0,
+    crop.width,
+    crop.height
+  );
+
+  const ocr = await getOcrWorker();
+  const result = await ocr.recognize(crop);
+  const text = result.data.text.replace(/\s+/g, " ").trim();
+
+  return text;
+}
+
+async function scanPdf() {
+  const file = $("pdfFile").files[0];
+
+  if (!file) {
+    setStatus("Choose a PDF first.");
+    return;
+  }
+
+  $("scanButton").disabled = true;
+
+  const book = file.name.replace(/\.pdf$/i, "");
+  const pdf = await pdfjsLib.getDocument({
+    data: await file.arrayBuffer()
+  }).promise;
+
+  const from = Math.max(1, parseInt($("fromPage").value) || 1);
+  const to = Math.min(pdf.numPages, parseInt($("toPage").value) || pdf.numPages);
+
+  let added = 0;
+
+  for (let pageNumber = from; pageNumber <= to; pageNumber++) {
+    setStatus(`Scanning page ${pageNumber} of ${to}…`);
+
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale: 2 });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+
+    await page.render({
+      canvasContext: canvas.getContext("2d"),
+      viewport
+    }).promise;
+
+    const bands = detectHighlightBands(canvas);
+
+    for (const band of bands) {
+      const text = await readHighlightRegion(canvas, band);
+
+      if (!text || text.length < 3) continue;
+
+      const duplicate = highlights.some(
+        item =>
+          item.book === book &&
+          item.page === String(pageNumber) &&
+          item.text === text
+      );
+
+      if (duplicate) continue;
+
+      highlights.push({
+        id: Date.now() + "-" + Math.random(),
+        book,
+        page: String(pageNumber),
+        color: band.color,
+        text
+      });
+
+      added++;
+      save();
+      renderHighlights();
+    }
+  }
+
+  setStatus(`Done. Added ${added} highlight${added === 1 ? "" : "s"}.`);
+  $("scanButton").disabled = false;
+}
+
+function renderHighlights() {
+  const list = $("highlightList");
+
+  if (!highlights.length) {
+    list.innerHTML = '<div class="empty">No highlights yet.</div>';
+    return;
+  }
+
+  list.innerHTML = highlights
+    .map(
+      item => `
+        <div class="highlight ${item.color}">
+          <p>${item.text
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")}</p>
+
+          <div class="meta">
+            <span>
+              <span class="dot ${item.color}-dot"></span>
+              ${item.color.toUpperCase()} ·
+              ${item.book} · page ${item.page}
+            </span>
+
+            <button data-id="${item.id}">Delete</button>
+          </div>
+        </div>
+      `
+    )
+    .join("");
+
+  list.querySelectorAll("button[data-id]").forEach(button => {
+    button.onclick = () => {
+      highlights = highlights.filter(
+        item => item.id !== button.dataset.id
+      );
+
+      save();
+      renderHighlights();
+    };
+  });
+}
+
+async function downloadHighlights() {
+  if (!highlights.length) {
+    setStatus("No highlights to download.");
+    return;
+  }
+
+  const doc = new jspdf.jsPDF({
+    unit: "pt",
+    format: "a4"
+  });
+
+  let y = 50;
+
+  doc.setFontSize(20);
+  doc.text("My Highlights", 50, y);
+  y += 30;
+
+  for (const item of highlights) {
+    const lines = doc.splitTextToSize(item.text, 495);
+
+    if (y + lines.length * 16 > 780) {
+      doc.addPage();
+      y = 50;
+    }
+
+    doc.setFontSize(11);
+    doc.text(lines, 50, y);
+    y += lines.length * 16;
+
+    doc.setFontSize(9);
+    doc.setTextColor(120);
+    doc.text(
+      `${item.color.toUpperCase()} · ${item.book} · page ${item.page}`,
+      50,
+      y
+    );
+
+    doc.setTextColor(0);
+    y += 22;
+  }
+
+  doc.save("highlights.pdf");
+}
+
+$("scanButton").onclick = scanPdf;
+$("downloadButton").onclick = downloadHighlights;
+
+$("copyButton").onclick = async () => {
+  const text = highlights
+    .map(
+      item =>
+        `[${item.color.toUpperCase()}] ${item.text}\n${item.book}, page ${item.page}`
+    )
+    .join("\n\n");
+
+  await navigator.clipboard.writeText(text);
+  setStatus("Copied.");
+};
+
+$("clearButton").onclick = () => {
+  if (!confirm("Delete all saved highlights?")) return;
+
+  highlights = [];
+  save();
+  renderHighlights();
+  setStatus("Cleared.");
+};
+
+renderHighlights();
+</script>
+</body>
+</html>
